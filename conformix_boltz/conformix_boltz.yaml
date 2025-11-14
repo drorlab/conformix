@@ -1,0 +1,9 @@
+name: conformix_boltz
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pymol-open-source
+  - numpy>=2.0  
+  - pandas
+  - numba
