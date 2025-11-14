@@ -22,7 +22,7 @@ class ModelVarType(enum.Enum):
     What is used as the model's output variance.
 
     The LEARNED_RANGE option has been added to allow the model to predict
-    values between FIXED_SMALL and FIXED_LARGE, making its job easier.
+    values between FIXED_SMALL and FIXED_LARGE, making its fob easier.
     """
 
     LEARNED = enum.auto()
@@ -214,7 +214,7 @@ class TwistedDDPM:
             self.clear_cache()
 
             # line 2 in Alg 1 pseudocode
-            xt = self.ref_sample(P)
+            xt = self.ref_sample()
             log_proposal = self.ref_log_density(xt)
             if collapse_proposal_shape:
                 log_proposal = log_proposal.sum(self.particle_base_dims)
