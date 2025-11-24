@@ -577,6 +577,48 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
     manifest.dump(out_dir / "processed" / "manifest.json")
 
 
+def load_model(
+        cache=Path("~/.cache"),
+        checkpoint=None,
+        recycling_steps: int = 3,
+        sampling_steps: int = 200,
+        diffusion_samples: int = 1,
+        write_full_pae: bool = True,
+        write_full_pde: bool = True,
+    ) -> Boltz1:
+
+    # Set cache path
+    cache = Path(cache).expanduser()
+    cache.mkdir(parents=True, exist_ok=True)
+
+    # Download necessary data and model
+    download(cache)
+
+    if checkpoint is None:
+        checkpoint = cache / "boltz1_conf.ckpt"
+
+    predict_args = {
+        "recycling_steps": recycling_steps,
+        "sampling_steps": sampling_steps,
+        "diffusion_samples": diffusion_samples,
+        "write_confidence_summary": True,
+        "write_full_pae": write_full_pae,
+        "write_full_pde": write_full_pde,
+    }
+    model_module: Boltz1 = Boltz1.load_from_checkpoint(
+        checkpoint,
+        strict=True,
+        predict_args=predict_args,
+        map_location="cpu",
+        diffusion_process_args=asdict(BoltzDiffusionParams()),
+        ema=False,
+        conformix=True,
+    )
+    model_module.eval()
+
+    return model_module
+
+
 @click.group()
 def cli() -> None:
     """Boltz1."""
@@ -717,6 +759,7 @@ def predict(
     single_sequence_mode: bool = False,
     msa_server_url: str = "https://api.colabfold.com",
     msa_pairing_strategy: str = "greedy",
+    model_module: Boltz1 = None,
 ) -> None:
     """
     Run predictions with Boltz-1.
@@ -847,14 +890,15 @@ def predict(
         "write_full_pae": write_full_pae,
         "write_full_pde": write_full_pde,
     }
-    model_module: Boltz1 = Boltz1.load_from_checkpoint(
-        checkpoint,
-        strict=True,
-        predict_args=predict_args,
-        map_location="cpu",
-        diffusion_process_args=asdict(BoltzDiffusionParams()),
-        ema=False,
-    )
+    if not model_module:
+        model_module: Boltz1 = Boltz1.load_from_checkpoint(
+            checkpoint,
+            strict=True,
+            predict_args=predict_args,
+            map_location="cpu",
+            diffusion_process_args=asdict(BoltzDiffusionParams()),
+            ema=False,
+        )
     model_module.eval()
 
     # Create prediction writer

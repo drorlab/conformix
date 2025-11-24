@@ -983,6 +983,7 @@ def predict(
     fbhw_width: bool = 0.0,
     avoid: bool = False,
     ess_threshold: float = 1/3,
+    model_module: Boltz1 = None,
 ) -> None:
     """Run predictions with Boltz-1."""
     # If cpu, write a friendly warning
@@ -1101,15 +1102,16 @@ def predict(
         "write_full_pde": write_full_pde,
         "twisted_sample": twisted_sample
     }
-    model_module: Boltz1 = Boltz1.load_from_checkpoint(
-        checkpoint,
-        strict=True,
-        predict_args=predict_args,
-        map_location="cpu",
-        diffusion_process_args=asdict(BoltzDiffusionParams()),
-        ema=False,
-        conformix=True,
-    )
+    if not model_module:
+        model_module: Boltz1 = Boltz1.load_from_checkpoint(
+            checkpoint,
+            strict=True,
+            predict_args=predict_args,
+            map_location="cpu",
+            diffusion_process_args=asdict(BoltzDiffusionParams()),
+            ema=False,
+            conformix=True
+        )
 
     model_module.confidence_module.use_s_diffusion = False
     model_module.accumulate_token_repr = False
