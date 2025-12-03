@@ -30,14 +30,12 @@ from Bio.PDB import MMCIFParser, PDBParser, Polypeptide
 from typing import Union, List, Optional, Literal
 import pymol
 from pymol import cmd
-import numpy as np
 import glob
 
 CCD_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl"
 MODEL_URL = (
     "https://huggingface.co/boltz-community/boltz-1/resolve/main/boltz1_conf.ckpt"
 )
-
 
 @dataclass
 class BoltzProcessedInput:
@@ -56,7 +54,7 @@ class BoltzDiffusionParams:
     gamma_min: float = 1.107
     noise_scale: float = 0.901
     rho: float = 8
-    step_scale: float = 1. ## changed to 1 for ease of noising injections, originally 1.638
+    step_scale: float = 1. # changed from Boltz default of 1.638
     sigma_min: float = 0.0004
     sigma_max: float = 160.0
     sigma_data: float = 16.0
@@ -139,8 +137,6 @@ def check_inputs(
             elif d.is_dir():
                 msg = f"Found directory {d} instead of .fasta or .yaml."
                 raise RuntimeError(msg)
-            elif constraint_z and twist_rmsd:
-                raise ValueError("Both constraint_z and twist_rmsd cannot be True at the same time.")
             else:
                 msg = (
                     f"Unable to parse filetype {d.suffix}, "
@@ -393,26 +389,23 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
     manifest = Manifest(records)
     manifest.dump(out_dir / "processed" / "manifest.json")
 
-def get_secondary_structure_masks(structure_file, twist_residue1=None, twist_residue2=None, exclude_residues=None):
+def get_secondary_structure_region_masks(structure_file, subset_residues=None):
     """
     Create masks where only beta sheets and helices are marked as 1.
     Uses PyMOL's secondary structure assignments.
     
     Parameters:
     structure_file: Path to CIF/PDB file from untwisted output
-    twist_residue1: Start residue number of twist region (optional)
-    twist_residue2: End residue number of twist region (optional)
-    exclude_residues: Residues to exclude from ss_atom_mask_region (optional)
-                     Can be provided as:
-                     - String with comma-separated values: "100,50-55,105-110"
-                     - List of values: [100, "50-55", [105, 110]]
-                     - Single integer: 100
+    subset_residues: List of residue numbers defining the twist region (optional)
+        Can be provided as:
+            - String with comma-separated values: "100,50-55,105-110"
+            - List of values: [100, "50-55", [105, 110]]
+            - Single integer: 100
     
     Returns:
     atom_coords: Tensor of atom coordinates
-    ss_atom_mask: Tensor of atom mask (1 for ss, 0 otherwise)
-    ss_atom_mask_region: Tensor of atom mask (1 for ss within twist region and not excluded, 0 otherwise)
-                         If twist_residues=None, this is the same as ss_atom_mask but with excluded residues set to 0.
+    region_mask: Tensor mask (if subset_residues is provided, 1 for atoms in specified residue region, 0 otherwise)
+    ss_atom_mask: Tensor mask (1 for atoms in secondary structure (helices/sheets), 0 otherwise)
     """
     # Determine file type and parse accordingly
     if structure_file.endswith(".cif"):
@@ -462,82 +455,34 @@ def get_secondary_structure_masks(structure_file, twist_residue1=None, twist_res
     
     # Prepare for region mask
     region_mask = []
-    # Process region parameters
-    region_defined = twist_residue1 is not None and twist_residue2 is not None
-    if region_defined:
-        print(f"Twisting on RMSD of region between residues {twist_residue1} and {twist_residue2}")
-        min_res = min(twist_residue1, twist_residue2)
-        max_res = max(twist_residue1, twist_residue2)
-    else:
-        print("Twisting on RMSD of all residues")
     
-    # Process exclude_residues to create a set of all excluded residue numbers
-    exclude_set = set()
-    if exclude_residues is not None:
-        # Handle different input formats for exclude_residues
-        if isinstance(exclude_residues, str):
-            # String format: "100,50-55,105-110"
-            exclude_items = [item.strip() for item in exclude_residues.split(',')]
-        elif isinstance(exclude_residues, list):
-            # List format: [100, "50-55", [105, 110]]
-            exclude_items = exclude_residues
-        else:
-            # Single value: 100
-            exclude_items = [exclude_residues]
-            
-        for item in exclude_items:
-            if isinstance(item, int):
-                # Single residue number
-                exclude_set.add(item)
-            elif isinstance(item, str):
-                if "-" in item:
-                    # Range specified as "start-end"
-                    parts = item.split("-")
-                    if len(parts) == 2:
-                        try:
-                            start, end = int(parts[0]), int(parts[1])
-                            exclude_set.update(range(start, end + 1))  # +1 to include end
-                        except ValueError:
-                            print(f"Warning: Could not parse range '{item}', skipping")
-                else:
-                    # Try to parse as a single integer
-                    try:
-                        exclude_set.add(int(item))
-                    except ValueError:
-                        print(f"Warning: Could not parse '{item}' as an integer, skipping")
-            elif isinstance(item, list) and len(item) == 2:
-                # Range specified as [start, end]
-                try:
-                    start, end = int(item[0]), int(item[1])
-                    exclude_set.update(range(start, end + 1))  # +1 to include end
-                except (ValueError, TypeError):
-                    print(f"Warning: Could not parse range {item}, skipping")
+    # If subset_residues is supplied, create mask of inluded residues only
+    subset_set = set()
+    if subset_residues is not None:
+        # Parse comma-separated string: "100,50-55,105-110"
+        items = [item.strip() for item in subset_residues.split(',')]
+        
+        for item in items:
+            if "-" in item:
+                # Range: "50-55"
+                start, end = map(int, item.split("-"))
+                subset_set.update(range(start, end + 1))
             else:
-                print(f"Warning: Unrecognized format in exclude_residues: {item}, skipping")
-    
-    if exclude_set:
-        print(f"Excluding residues: {sorted(exclude_set)}")
+                # Single residue: "100"
+                subset_set.add(int(item))
+        
+        print(f"Including only residues: {sorted(subset_set)}")
+    else:
+        print("Including all residues (subset_residues is None)")
     
     for atom in all_atoms.atom:
         # Check if in secondary structure
         in_ss = (atom.chain, atom.resi, atom.name) in ss_atom_ids
         atom_mask.append(1 if in_ss else 0)
 
-        # Get residue number
-        try:
-            res_num = int(atom.resi)
-            
-            # Determine if this atom should be included in region mask
-            if region_defined:
-                # When region is defined, only include if within region AND not excluded
-                in_region = min_res <= res_num <= max_res and res_num not in exclude_set
-            else:
-                # When no region defined, include everything except excluded residues
-                in_region = res_num not in exclude_set
-        except ValueError:
-            # Handle case where resi might contain insertion codes or non-integer values
-            raise ValueError(f"Error: Non-integer residue identifier '{atom.resi}' encountered.")
-            
+        # Determine if atom is in the specified region
+        res_num = int(atom.resi)
+        in_region = res_num in subset_set if subset_set else True
         region_mask.append(1 if in_region else 0)
     
     # Clean up
@@ -548,114 +493,8 @@ def get_secondary_structure_masks(structure_file, twist_residue1=None, twist_res
     atom_coords = torch.tensor(np.array(atom_coords))
     ss_atom_mask = torch.tensor(atom_mask, dtype=int)
     region_mask = torch.tensor(region_mask, dtype=int)
-    
-    # Apply both masks: secondary structure AND region (with exclusions)
-    ss_atom_mask_region = ss_atom_mask * region_mask
 
-    return atom_coords, ss_atom_mask, ss_atom_mask_region
-
-def get_region_index_ranges(cif_file, chain_id1, res_id1, chain_id2, res_id2, flank_size):
-    """
-    Get atom index ranges for two regions in a protein structure and a descriptive string.
-    
-    Args:
-        cif_file: Path to the CIF file
-        chain_id1: Chain identifier for first region
-        res_id1: ID of the first central residue
-        chain_id2: Chain identifier for second region
-        res_id2: ID of the second central residue
-        flank_size: Number of residues to include on each side
-        
-    Returns:
-        region1_range: Tuple of (min, max) atom indices for region 1
-        region2_range: Tuple of (min, max) atom indices for region 2
-        desc_string: String in format "Nid_1-Nid_2" where N are residue types (e.g., "ALA12-GLY34")
-    """
-    # Parse CIF file
-    parser = MMCIFParser()
-    structure = parser.get_structure("structure", cif_file)
-    
-    # Build atom info list
-    atom_coords = []
-    atom_info = []  # (model_id, chain_id, res_id, res_name, atom_name, atom_serial)
-    for model in structure:
-        for chain in model:
-            for res in chain:
-                if res.id[0] != ' ':  # Skip hetero-atoms and waters
-                    continue
-                res_id = res.id[1]
-                for atom in res:
-                    atom_coords.append(atom.coord)
-                    atom_info.append((model.id, chain.id, res_id, res.resname, atom.name, atom.serial_number))
-    
-    # Get residue IDs for each chain
-    chain1_res_ids = sorted(list(set([res_id for _, c_id, res_id, _, _, _ in atom_info if c_id == chain_id1])))
-    chain2_res_ids = sorted(list(set([res_id for _, c_id, res_id, _, _, _ in atom_info if c_id == chain_id2])))
-    
-    # Find central residue indices
-    try:
-        central_idx1 = chain1_res_ids.index(res_id1)
-        central_idx2 = chain2_res_ids.index(res_id2)
-    except ValueError:
-        # Return empty ranges if residues not found
-        return (0, 0), (0, 0)
-    
-    # Calculate region residue ranges
-    start_idx1 = max(0, central_idx1 - flank_size)
-    end_idx1 = min(len(chain1_res_ids) - 1, central_idx1 + flank_size)
-    start_idx2 = max(0, central_idx2 - flank_size)
-    end_idx2 = min(len(chain2_res_ids) - 1, central_idx2 + flank_size)
-    
-    region1_res_ids = set(chain1_res_ids[start_idx1:end_idx1 + 1])
-    region2_res_ids = set(chain2_res_ids[start_idx2:end_idx2 + 1])
-    
-    # Get atom indices for regions
-    region1_indices = [i for i, (_, c_id, res_id, _, _, _) in enumerate(atom_info) 
-                       if c_id == chain_id1 and res_id in region1_res_ids]
-    region2_indices = [i for i, (_, c_id, res_id, _, _, _) in enumerate(atom_info) 
-                       if c_id == chain_id2 and res_id in region2_res_ids]
-    
-    # Get index ranges
-    region1_range = (min(region1_indices) if region1_indices else 0, 
-                    max(region1_indices) if region1_indices else 0)
-    region2_range = (min(region2_indices) if region2_indices else 0, 
-                    max(region2_indices) if region2_indices else 0)
-    
-    # Get residue types for description string
-    res1_type = None
-    res2_type = None
-    
-    # Find residue types by looking through the structure again
-    for model in structure:
-        for chain in model:
-            if chain.id == chain_id1:
-                for res in chain:
-                    if res.id[1] == res_id1 and res.id[0] == ' ':
-                        res1_type = res.resname
-            if chain.id == chain_id2:
-                for res in chain:
-                    if res.id[1] == res_id2 and res.id[0] == ' ':
-                        res2_type = res.resname
-    
-    # Function to convert three-letter to one-letter amino acid codes
-    def get_one_letter(three_letter_code):
-        try:
-            # Convert three-letter to index
-            index = Polypeptide.three_to_index(three_letter_code)
-            # Convert index to one-letter
-            return Polypeptide.index_to_one(index)
-        except (ValueError, KeyError):
-            # If conversion fails, return "X"
-            return "X"
-    
-    # Convert three-letter codes to one-letter codes
-    res1_one_letter = get_one_letter(res1_type) if res1_type else "X"
-    res2_one_letter = get_one_letter(res2_type) if res2_type else "X"
-    
-    # Create description string with one-letter codes
-    desc_string = f"{res1_one_letter}{res_id1}-{res2_one_letter}{res_id2}"
-    
-    return region1_range, region2_range, desc_string
+    return atom_coords, region_mask, ss_atom_mask
 
 def get_residue_atoms_mask(structure_file, residue_ranges, chain_id="A"):
     """
@@ -671,8 +510,6 @@ def get_residue_atoms_mask(structure_file, residue_ranges, chain_id="A"):
         atom_coords: Numpy array of atom coordinates
         atom_mask: Numpy array mask (1 for atoms in specified residues, 0 otherwise)
     """
-    import numpy as np
-    
     # Determine file type and parse accordingly
     if structure_file.endswith(".cif"):
         from Bio.PDB import MMCIFParser
@@ -724,7 +561,6 @@ def cli() -> None:
     """Boltz1."""
     return
 
-
 @cli.command()
 @click.argument("data", type=click.Path(exists=True))
 @click.option("--input_cif", type=click.Path(exists=True),
@@ -737,30 +573,54 @@ def cli() -> None:
     help="The path where to save the predictions.",
     default="./",
 )
-@click.option("--twist_residue1", type=int,
-    help="ID of the central residue for the first twisting region.",
+@click.option(
+    "--twist_target_values",
+    help="Comma-separated list of twisting target values for twist_fn variations.",
+    default="1.0",
+    callback=lambda ctx, param, value: [float(x) for x in value.split(',')] if isinstance(value, str) else ([float(value)] if isinstance(value, (int, float)) else value)
+)
+@click.option("--subset_residues", type=str,
+    help="Residues to include in the twisting region. Comma-separated list of residue numbers or ranges. "
+         "Examples: '100' (single residue), '50-55' (range), '100,50-55,105-110' (multiple specifications). "
+         "If not provided, all residues are considered for twisting.",
     default=None
 )
-@click.option("--twist_residue2", type=int,
-    help="ID of the central residue for the first twisting region.",
-    default=None
+@click.option(
+    "--twist_rmsd_full_sequence",
+    is_flag=True,
+    help="Twist using RMSD on full (or subseted) sequence, not just secondary structure regions. Default is False.",
+    default=False,
 )
-@click.option("--exclude_residues", type=str,
-    help="Residues to exclude from the twisting region. Comma-separated list of residue numbers or ranges. "
-         "Examples: '100' (single residue), '50-55' (range), '100,50-55,105-110' (multiple specifications).",
-    default=None
+@click.option(
+    "--twist_strength_values",
+    help="Comma-separated list of twisting strength values for twist_fn variations. "
+    "Default 15, used in ConforMixRMSD testing.",
+    default="15.0",
+    callback=lambda ctx, param, value: [float(x) for x in value.split(',')] if isinstance(value, str) else ([float(value)] if isinstance(value, (int, float)) else value)
 )
-@click.option("--flank_size", type=int,
-    help="Number of residues to include on each side of the central residue in twisting region.",
-    default=5
+@click.option(
+    "--tstart_step",
+    type=str,
+    default="200",
+    help="Diffusion step to start twisting. Default 200 (first step)."
 )
-@click.option("--chain_id1", type=str,
-    help="Chain identifier for the first region.",
-    default="A"
+@click.option(
+    "--tstop_step",
+    type=str,
+    default="0",
+    help="Diffusion step to stop twisting. Default 0 (last step)."
 )
-@click.option("--chain_id2", type=str,
-    help="Chain identifier for the second region.",
-    default="A"
+@click.option(
+    "--ess_threshold",
+    type=float,
+    default=1/3,
+    help="effective sample size threshold in range [0,1], controls TDS"
+)
+@click.option(
+    "--diffusion_samples",
+    type=int,
+    help="The number of diffusion samples to use for prediction. Default to 5.",
+    default=5,
 )
 @click.option(
     "--cache",
@@ -797,12 +657,6 @@ def cli() -> None:
     type=int,
     help="The number of sampling steps to use for prediction. Default is 200.",
     default=200,
-)
-@click.option(
-    "--diffusion_samples",
-    type=int,
-    help="The number of diffusion samples to use for prediction. Default to 5.",
-    default=5,
 )
 @click.option(
     "--write_full_pae",
@@ -856,102 +710,11 @@ def cli() -> None:
     help="Pairing strategy to use. Used only if --use_msa_server is set. Options are 'greedy' and 'complete'",
     default="greedy",
 )
-@click.option(
-    "--save_intermediates",
-    is_flag=True,
-    help="Whether to save intermediate structures during diffusion. Default is False.",
-)
-@click.option(
-    "--inject_step",
-    type=int,
-    help="The step at which to inject coordinates during diffusion. Default is None.",
-    default=None,
-)
-@click.option(
-    "--inject_coords",
-    type=click.Path(exists=True),
-    help="Path to the file containing coordinates to inject during diffusion. Default is None.",
-    default=None,
-)
-@click.option(
-    "--inject_step_from_filename",
-    is_flag=True,
-    help="Whether to extract the injection step from the filename. Default is False.",
-    default=False,
-)
-@click.option(
-    "--alpha_values",
-    help="Comma-separated list of alpha values for twist_fn variations.",
-    default="15.0",
-    callback=lambda ctx, param, value: [float(x) for x in value.split(',')] if isinstance(value, str) else ([float(value)] if isinstance(value, (int, float)) else value)
-)
-@click.option(
-    "--beta_values",
-    help="Comma-separated list of beta values for twist_fn variations.",
-    default="1.0",
-    callback=lambda ctx, param, value: [float(x) for x in value.split(',')] if isinstance(value, str) else ([float(value)] if isinstance(value, (int, float)) else value)
-)
-@click.option(
-    "--tstart_step",
-    type=str,
-    default="200",
-    help="Start steps for twist function, comma separated"
-)
-@click.option(
-    "--tstop_step",
-    type=str,
-    default="0",
-    help="Stop steps for twist function, comma separated"
-)
-@click.option(
-    "--fbhw_width",
-    type=float,
-    default="0",
-    help="flat bottom harmonic width, default 0 (no flat bottom)"
-)
-@click.option(
-    "--constraint_z",
-    default=False,
-    is_flag=True,
-    type=bool,
-    help="apply z type twist"
-)
-@click.option(
-    "--twist_rmsd",
-    default=False,
-    is_flag=True,
-    type=bool,
-    help="twisting using RMSD"
-)
-@click.option(
-    "--twist_rmsd_full_sequence",
-    is_flag=True,
-    help="twisting using RMSD on full sequence, not just secondary structure",
-    default=False,
-)
-@click.option(
-    "--avoid",
-    default=False,
-    is_flag=True,
-    type=bool,
-    help="bias away from beta instead of towards"
-)
-@click.option(
-    "--ess_threshold",
-    type=float,
-    default=1/3,
-    help="effective sample size threshold in range [0,1], controls TDS"
-)
 def predict(
     data: str,
     out_dir: str,
     input_cif: str,
-    twist_residue1: int = None,
-    twist_residue2: int = None,
-    exclude_residues: Optional[List[Union[int, List[int], str]]] = None,
-    flank_size: int = 5,
-    chain_id1: str = "A",
-    chain_id2: str = "A",
+    subset_residues: Optional[List[Union[int, List[int], str]]] = None,
     cache: str = "~/.boltz",
     checkpoint: Optional[str] = None,
     devices: int = 1,
@@ -968,71 +731,33 @@ def predict(
     use_msa_server: bool = False,
     msa_server_url: str = "https://api.colabfold.com",
     msa_pairing_strategy: str = "greedy",
-    save_intermediates: bool = False,
-    inject_step: Optional[int] = None,
-    inject_coords: Optional[str] = None,
-    inject_step_from_filename: bool = False,
-    twisted_sample: bool = True,
-    alpha_values: Union[float, List[float]] = 15.0,
-    beta_values: Union[float, List[float]] = 1.0,
+    conformix: bool = True,
+    twist_target_values: Union[float, List[float]] = 1.0,
+    twist_strength_values: Union[float, List[float]] = 15.0,
     tstart_step: str = "200",
     tstop_step: str = "0",
-    constraint_z: bool = False,
-    twist_rmsd: bool = False,
     twist_rmsd_full_sequence: bool = False,
-    fbhw_width: bool = 0.0,
-    avoid: bool = False,
     ess_threshold: float = 1/3,
     model_module: Boltz1 = None,
 ) -> None:
     """Run predictions with Boltz-1."""
-    # If cpu, write a friendly warning
+
     if accelerator == "cpu":
         msg = "Running on CPU, this will be slow. Consider using a GPU."
         click.echo(msg)
 
-    # Set no grad
-    ## JKARA DDR GRADIENT SEARCHING
-    # torch.set_grad_enabled(False)
-
-    # Ignore matmul precision warning
     torch.set_float32_matmul_precision("highest")
 
-    # Set seed if desired
     if seed is not None:
         seed_everything(seed)
 
-    # Set cache path
     cache = Path(cache).expanduser()
     cache.mkdir(parents=True, exist_ok=True)
-
-    ## JKARA: Injection preparation
-    # Ensure that only one of inject_step and inject_step_from_filename is defined
-    assert not (inject_step and inject_step_from_filename), "Specify either inject_step or inject_step_from_filename, not both."
-
-    assert not (twist_rmsd and twist_rmsd_full_sequence), "twist_rmsd and twist_rmsd_full_sequence are mutually exclusive. Please choose one."
-
-    # Extract injection step from inject_coords file name if using inject_step_from_filename
-    if inject_step_from_filename:
-        inject_step = int(re.search(r'step_(\d+)', inject_coords).group(1))
-
-    # Ensure injection step is within [0,200], i.e. number of diffusion steps
-    if inject_step:
-        assert 0 <= inject_step <= 200, f"Injection step read as {inject_step}, must be between 0 and 200"
-    # Ensure that if inject_step is defined, inject_coords is also defined (and vice versa)
-    if (inject_step is None) != (inject_coords is None):
-        raise ValueError("Either both inject_step and inject_coords must be defined, or neither.")
 
     # Create output directories
     data = Path(data).expanduser()
     out_dir = Path(out_dir).expanduser()
     out_dir = out_dir / f"boltz_results_{data.stem}"
- 
-    ## JKARA: Add injection step subfolder to output directory
-    if inject_step is not None:
-        # Extract injection source from inject_coords file name
-        inject_source = Path(inject_coords).stem.split('_')[0]
-        out_dir = out_dir / f"inject_from_{inject_source}" / f"inject_from_{inject_source}_step_{inject_step:03d}"
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1043,20 +768,7 @@ def predict(
     data = check_inputs(data, out_dir, override)
     if not data:
         click.echo("No predictions to run, exiting.")
-        return desc_string 
-
-    # Set up trainer
-    strategy = "auto"
-    if (isinstance(devices, int) and devices > 1) or (
-        isinstance(devices, list) and len(devices) > 1
-    ):
-        strategy = DDPStrategy()
-        if len(data) < devices:
-            msg = (
-                "Number of requested devices is greater "
-                "than the number of predictions."
-            )
-            raise ValueError(msg)
+        return 
 
     msg = f"Running predictions for {len(data)} structure"
     msg += "s" if len(data) > 1 else ""
@@ -1100,7 +812,7 @@ def predict(
         "write_confidence_summary": True,
         "write_full_pae": write_full_pae,
         "write_full_pde": write_full_pde,
-        "twisted_sample": twisted_sample
+        "conformix": conformix,
     }
     if not model_module:
         model_module: Boltz1 = Boltz1.load_from_checkpoint(
@@ -1110,7 +822,6 @@ def predict(
             map_location="cpu",
             diffusion_process_args=asdict(BoltzDiffusionParams()),
             ema=False,
-            conformix=True
         )
 
     model_module.confidence_module.use_s_diffusion = False
@@ -1119,38 +830,27 @@ def predict(
     model_module.eval()
 
     # Parse alpha and beta values
-    alpha_values = [float(alpha_values)] if isinstance(alpha_values, (int, float)) else [float(v) for v in alpha_values]    
-    beta_values = [float(beta_values)] if isinstance(beta_values, (int, float)) else [float(v) for v in beta_values]
+    twist_target_values = [float(twist_target_values)] if isinstance(twist_target_values, (int, float)) else [float(v) for v in twist_target_values]
+    twist_strength_values = [float(twist_strength_values)] if isinstance(twist_strength_values, (int, float)) else [float(v) for v in twist_strength_values]    
 
     # Parse tstart and tstop values
     tstart_values = [int(x) for x in tstart_step.split(",")]
     tstop_values = [int(x) for x in tstop_step.split(",")]
 
-    # Parse twist_region1 and twist_region2
-    if twist_rmsd:
-        untwisted_coords, ss_atom_mask, ss_atom_mask_region = get_secondary_structure_masks(input_cif, twist_residue1, twist_residue2, exclude_residues)
-        # TEMP
-        # if twist_residue1==1 and twist_residue2==1:
-        #     untwisted_coords, ss_atom_mask_region = get_residue_atoms_mask(input_cif, [[3,31], [40,67], [75,108], [120, 141], [170,202], [207,241], [250,271]])
-        #     print("Twisting B2AR TM helices")
-        # END TEMP
-        desc_string = "rmsd"
-        if twist_residue1 and twist_residue2 and twist_residue1 != twist_residue2:
-            desc_string = f"rmsd_{twist_residue1}-{twist_residue2}"
-        existing_runs = glob.glob(str(out_dir / "predictions" / f"{desc_string}" / "run*"))
-        run_num = len(existing_runs)
-        desc_string = f"{desc_string}/run{run_num:02d}"
-        twist_region1, twist_region2 = (0, 0), (0, 0)
-    elif twist_rmsd_full_sequence:
-        untwisted_coords, ss_atom_mask, ss_atom_mask_region = get_secondary_structure_masks(input_cif, twist_residue1, twist_residue2, exclude_residues)
-        ss_atom_mask_region = torch.ones_like(ss_atom_mask_region)
+    untwisted_coords, region_mask, ss_atom_mask = get_secondary_structure_region_masks(input_cif, subset_residues)
+    
+    desc_string = "rmsd"
+    twisting_mask = ss_atom_mask
+    if twist_rmsd_full_sequence:
         desc_string = "rmsd_full_sequence"
-        existing_runs = glob.glob(str(out_dir / "predictions" / f"{desc_string}" / "run*"))
-        run_num = len(existing_runs)
-        desc_string = f"{desc_string}/run{run_num:02d}"
-        twist_region1, twist_region2 = (0, 0), (0, 0)
-    else:
-        twist_region1, twist_region2, desc_string = get_region_index_ranges(input_cif, chain_id1, twist_residue1, chain_id2, twist_residue2, flank_size)
+        twisting_mask = torch.ones_like(ss_atom_mask)
+    if subset_residues:
+        desc_string = desc_string + "_" + "_".join([str(r) for r in subset_residues])
+        twisting_mask = twisting_mask * region_mask
+        
+    existing_runs = glob.glob(str(out_dir / "predictions" / f"{desc_string}" / "run*"))
+    run_num = len(existing_runs)
+    desc_string = f"{desc_string}/run{run_num:02d}"
 
     # Move model to the correct device
     device = torch.device('cuda' if accelerator == 'gpu' else accelerator)
@@ -1166,7 +866,7 @@ def predict(
                 num_sampling_steps=sampling_steps,
                 diffusion_samples=1,
                 run_confidence_sequentially=True,
-                twisted_sample=False,
+                conformix=False,
                 save_diff_inputs=True
             )
 
@@ -1184,60 +884,17 @@ def predict(
             }
 
         # Define twist_fn with parameters alpha and beta
-        def twist_fn(alpha, beta, tstart_step, tstop_step, fbhw_width, constraint_z, twist_rmsd, avoid):
+        def twist_fn(alpha, beta, tstart_step, tstop_step, bias_type='rmsd'):
+            
             def inner_twist_fn(xt, x0_hat, return_grad=True, t=None, atom_mask=None):
-                def log_bias_potential(atom_pos: torch.Tensor):
-                    # atom_diff = torch.mean(atom_pos[:, 1940:1990], dim=-2) - torch.mean(atom_pos[:, 990:1040], dim=-2)
-                    # atom_diff = torch.mean(atom_pos[:, 408:495], dim=-2) - torch.mean(atom_pos[:, 408+730:495+730], dim=-2) #semisweet SER58-SER58 region
-                    # atom_diff = torch.mean(atom_pos[:, 598:694], dim=-2) - torch.mean(atom_pos[:, 598+730:694+730], dim=-2) #semisweet ASN83-ASN83 region
-
-                    atom_diff = torch.mean(atom_pos[:, twist_region1[0]:twist_region1[1]], dim=-2) - torch.mean(atom_pos[:, twist_region2[0]:twist_region2[1]], dim=-2)
-                    atom_dist = torch.norm(atom_diff, dim=-1)
-                    target_diff = beta  # Adjust target distance based on alpha and beta
-
-                    within_fb = torch.abs(atom_dist - target_diff) < fbhw_width / 2.0
-
-                    if avoid:
-                        potential = -((atom_dist - target_diff)**2 - (fbhw_width / 2.0)**2)
-                        return torch.where(within_fb, potential, torch.zeros_like(atom_dist))
-
-                    potential = torch.minimum((atom_dist - (target_diff - fbhw_width / 2.0))**2, (atom_dist - (target_diff + fbhw_width / 2.0))**2)
-                    return torch.where(within_fb, torch.zeros_like(atom_dist), potential)
-
-                def bias_potential_z(atom_pos: torch.Tensor):
-                    protein_mean = torch.mean(atom_pos[:, :2300], axis=-2, keepdim=True)
-                    atom_pos = atom_pos - protein_mean
-
-                    # compute lig pos wrt protein
-                    lig_pos = torch.mean(atom_pos[:, 2320:2348], axis=-2)
-
-                    # compute protein principal axis
-                    P = atom_pos.shape[0]
-                    particle_z_coords = torch.zeros(P, device=atom_pos.device)
-
-                    for particle in range(P):
-                        pca = PCA(n_components=3)
-                        pca.fit(atom_pos[particle, :2300])
-
-                        long_axis = principal_axes = pca.components_[0]
-
-                        # project ligand position onto that axis
-                        z_coord = torch.dot(lig_pos[particle], long_axis)
-                        z_sign = torch.sign(torch.dot(atom_pos[particle, 0], long_axis)) # define orientation such that positive is towards atom 0
-
-                        z_coord *= z_sign
-
-                        particle_z_coords[particle] += z_coord
-
-                    return (particle_z_coords - beta)**2
 
                 def log_bias_potential_rmsd(atom_pos: torch.Tensor, atom_mask: torch.Tensor):
                     batch_size = atom_pos.shape[0]
                     padded_atom_size = atom_pos.shape[1]
 
-                    ss_mask_region = torch.nn.functional.pad(
-                        ss_atom_mask_region, 
-                        (0, padded_atom_size - ss_atom_mask_region.shape[0]), 
+                    twisting_mask_region = torch.nn.functional.pad(
+                        twisting_mask, 
+                        (0, padded_atom_size - twisting_mask.shape[0]), 
                         value=0
                     ).to(atom_pos.device)
                     untwisted_pos = torch.nn.functional.pad(
@@ -1246,28 +903,40 @@ def predict(
                         value=0
                     ).to(atom_pos.device)
 
-
-                    atom_pos_aligned = weighted_rigid_align(atom_pos, untwisted_pos, atom_mask, ss_mask_region, keep_gradients=True)
-
+                    atom_pos_aligned = weighted_rigid_align(atom_pos, untwisted_pos, atom_mask, twisting_mask_region, keep_gradients=True)
 
                     # Compute RMSD between aligned atom_pos and untwisted_pos
                     mse_loss = ((atom_pos_aligned - untwisted_pos) ** 2).sum(dim=-1)
                     rmsd = torch.sqrt(
-                        torch.sum(mse_loss * ss_mask_region, dim=-1)
-                        / torch.sum(ss_mask_region, dim=-1)
+                        torch.sum(mse_loss * twisting_mask_region, dim=-1)
+                        / torch.sum(twisting_mask_region, dim=-1)
                     )
 
                     return (rmsd - beta)**2
 
-                if not constraint_z and not twist_rmsd and not twist_rmsd_full_sequence:
-                    log_potential_xt_batch = log_bias_potential(x0_hat)
-                elif constraint_z and not twist_rmsd and not twist_rmsd_full_sequence:
-                    log_potential_xt_batch = bias_potential_z(x0_hat)
-                elif not constraint_z and (twist_rmsd or twist_rmsd_full_sequence):
-                    #print("RMSD twist")
+                '''
+                Options to define altenate biasing potentials, e.g. based on distances between two regions in the protein:
+
+                def log_bias_potential_dist(atom_pos: torch.Tensor):
+                    # Example: distance between two regions
+                    region1 = (100, 120)  # Residue indices for region 1
+                    region2 = (150, 170)  # Residue indices for region 2
+
+                    atom_diff = torch.mean(atom_pos[:, region1[0]:region1[1]], dim=-2) - torch.mean(atom_pos[:, region2[0]:region2[1]], dim=-2)
+                    atom_dist = torch.norm(atom_diff, dim=-1)
+                    target_diff = beta 
+
+                    # Flat-bottom harmonic potential
+                    within_fb = torch.abs(atom_dist - target_diff) < fbhw_width / 2.0
+
+                    potential = torch.minimum((atom_dist - (target_diff - fbhw_width / 2.0))**2, (atom_dist - (target_diff + fbhw_width / 2.0))**2)
+                    return torch.where(within_fb, torch.zeros_like(atom_dist), potential)
+                '''
+                
+                if bias_type == 'rmsd':
                     log_potential_xt_batch = log_bias_potential_rmsd(x0_hat, atom_mask)
                 else:
-                    raise ValueError("Both constraint_z and twist_rmsd cannot be True at the same time.")
+                    raise NotImplementedError("Only 'rmsd' twisting function is implemented in this version.")
 
                 # convert it to an unnormalized probability
                 log_potential_xt_batch *= -1
@@ -1303,8 +972,8 @@ def predict(
                 else:
                     return log_potential_xt_batch.to(model_module.device).detach()
 
-            return inner_twist_fn
 
+            return inner_twist_fn
 
         def sample_step(sample_inputs, twist_fn_, pdistogram):
             try:
@@ -1374,49 +1043,35 @@ def predict(
                     raise {"exception": True}
 
         # Rerun sample_twisted function with variations
-        for i in range(len(alpha_values)):
-            for j in range(len(beta_values)):
+        for i in range(len(twist_strength_values)):
+            for j in range(len(twist_target_values)):
                 for tstart in tstart_values:
                     for tstop in tstop_values:
                         print(f"Running with input structure {input_cif}")
-                        print(f"Running variation {alpha_values[i]}, {beta_values[j]}, tstart {tstart}, tstop {tstop}")
+                        print(f"Running variation {twist_strength_values[i]}, {twist_target_values[j]}, tstart {tstart}, tstop {tstop}")
 
                         # Create dictionary with added information about twisting
                         input_dict = {
                             "desc_string": desc_string,
-                            "twist_residue1": twist_residue1,
-                            "twist_residue2": twist_residue2,
-                            "chain_id1": chain_id1,
-                            "chain_id2": chain_id2,
-                            "flank_size": flank_size,
-                            "twist_region1": twist_region1,
-                            "twist_region2": twist_region2,
-                            "alpha": alpha_values[i],
-                            "beta": beta_values[j],
+                            "alpha": twist_strength_values[i],
+                            "beta": twist_target_values[j],
                             "tstart": tstart,
                             "tstop": tstop,
-                            "fbhw_width": fbhw_width,
-                            "constraint_z": constraint_z,
-                            "twist_rmsd": twist_rmsd,
-                            "exclude_residues": exclude_residues,
-                            "avoid": avoid,
+                            "subset_residues": subset_residues,
                         }
 
                         sample_out = sample_step(
                             sample_inputs,
-                            twist_fn(alpha_values[i],
-                                    beta_values[j],
+                            twist_fn(twist_strength_values[i],
+                                    twist_target_values[j],
                                     tstart,
                                     tstop,
-                                    fbhw_width,
-                                    constraint_z,
-                                    twist_rmsd,
-                                    avoid),
+                                    bias_type='rmsd'
+                                    ),
                             out["pdistogram"]
                         )
 
-                        # full_output_dir = out_dir / "predictions" / desc_string /f"variation_alpha_{alpha_values[i]}_beta_{beta_values[j]}_tstart_{tstart}_tstop_{tstop}"
-                        full_output_dir = out_dir / "predictions" / desc_string / f"variation_alpha_{alpha_values[i]}_beta_{beta_values[j]}"
+                        full_output_dir = out_dir / "predictions" / desc_string / f"variation_alpha_{twist_strength_values[i]}_beta_{twist_target_values[j]}"
 
                         pred_writer = BoltzWriter(
                             data_dir=processed.targets_dir,
@@ -1424,66 +1079,33 @@ def predict(
                             output_format=output_format,
                         )
 
-                        # mask should be the same for all particles, take particle 0
-                        traj_mask = out["atom_mask"][0, :].cpu().bool()
+                        print('writing RMSD')
+                        atom_pos = sample_out["coords"]
+                        atom_mask = sample_out["masks"]
+                        padded_atom_size = atom_pos.shape[1]
 
-                        def mask_tensor(tensor, mask):
-                            """
-                            Args:
-                                tensor: tensor of shape (a, b, c, d)
-                                mask: boolean tensor of shape (c,)
-                            Returns:
-                                tensor of shape (a, b, number_of_True_in_mask, d)
-                            """
-                            # Expand mask to match tensor dimensions
-                            # None/newaxis adds a dimension
-                            expanded_mask = mask[None, None, :, None]
+                        padded_twisting_mask = torch.nn.functional.pad(
+                            twisting_mask, 
+                            (0, padded_atom_size - twisting_mask.shape[0]), 
+                            value=0
+                        ).to(atom_pos.device)
+                        untwisted_pos = torch.nn.functional.pad(
+                            untwisted_coords, 
+                            (0, 0, 0, padded_atom_size - untwisted_coords.shape[0]), 
+                            value=0
+                        ).to(atom_pos.device)
 
-                            # Broadcast the mask to all other dimensions
-                            expanded_mask = expanded_mask.expand(tensor.shape)
+                        atom_pos_aligned = weighted_rigid_align(atom_pos, untwisted_pos, atom_mask, padded_twisting_mask, keep_gradients=True)
 
-                            # Use boolean indexing along the c dimension
-                            return tensor[expanded_mask].reshape(tensor.shape[0], tensor.shape[1], -1, tensor.shape[3])
+                        # Compute RMSD between aligned atom_pos and untwisted_pos
+                        mse_loss = ((atom_pos_aligned - untwisted_pos) ** 2).sum(dim=-1)
+                        rmsd = torch.sqrt(
+                            torch.sum(mse_loss * padded_twisting_mask, dim=-1)
+                            / torch.sum(padded_twisting_mask, dim=-1)
+                        )
+                        rmsd = rmsd.cpu().numpy().tolist()
 
-                        # write out trajectories for particle 0 only
-                        # shape of tensors: nframes x nparticles x natoms x 3
-                        # tensor_to_netcdf(full_output_dir / 'intermediates_trace.nc',
-                        #                  mask_tensor(sample_out['xt_trace'], traj_mask)[:, 0, :, :],
-                        #                  ess_trace=sample_out['ess_trace'],
-                        #                  logp_y_given_x0_trace=sample_out['logp_y_given_x0_trace'][:,0], # only record particle 0
-                        #                  logsumexp_w_trace=torch.logsumexp(sample_out['log_w_trace'], dim=-1)
-                        #                  )
-                        # tensor_to_netcdf(full_output_dir / 'intermediates_twist_deltas_trace.nc',
-                        #                  mask_tensor(sample_out['grad_log_potential_xt_trace'], traj_mask)[:, 0, :, :]) 
-
-                        if twist_rmsd or twist_rmsd_full_sequence:
-                            print('writing RMSD')
-                            atom_pos = sample_out["coords"]
-                            atom_mask = sample_out["masks"]
-                            padded_atom_size = atom_pos.shape[1]
-
-                            ss_mask_region = torch.nn.functional.pad(
-                                ss_atom_mask_region, 
-                                (0, padded_atom_size - ss_atom_mask_region.shape[0]), 
-                                value=0
-                            ).to(atom_pos.device)
-                            untwisted_pos = torch.nn.functional.pad(
-                                untwisted_coords, 
-                                (0, 0, 0, padded_atom_size - untwisted_coords.shape[0]), 
-                                value=0
-                            ).to(atom_pos.device)
-
-                            atom_pos_aligned = weighted_rigid_align(atom_pos, untwisted_pos, atom_mask, ss_mask_region, keep_gradients=True)
-
-                            # Compute RMSD between aligned atom_pos and untwisted_pos
-                            mse_loss = ((atom_pos_aligned - untwisted_pos) ** 2).sum(dim=-1)
-                            rmsd = torch.sqrt(
-                                torch.sum(mse_loss * ss_mask_region, dim=-1)
-                                / torch.sum(ss_mask_region, dim=-1)
-                            )
-                            rmsd = rmsd.cpu().numpy().tolist()
-
-                            input_dict["input_cif"] = input_cif
+                        input_dict["input_cif"] = input_cif
 
                         pred_writer.write_on_batch_end(
                             trainer=None,
@@ -1494,7 +1116,7 @@ def predict(
                             batch_idx=None,
                             dataloader_idx=None,
                             input_dict=input_dict,
-                            rmsd=rmsd if twist_rmsd else None,
+                            rmsd=rmsd,
                         )
 
 

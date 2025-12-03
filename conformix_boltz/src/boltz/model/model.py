@@ -74,7 +74,6 @@ class Boltz1(LightningModule):
         min_dist: float = 2.0,
         max_dist: float = 22.0,
         predict_args: Optional[dict[str, Any]] = None,
-        conformix: bool = False,
     ) -> None:
         super().__init__()
 
@@ -202,12 +201,8 @@ class Boltz1(LightningModule):
                 fullgraph=False,
             )
 
-        # Output modules
-        if conformix:
-            diffusion_module = ConformixAtomDiffusion
-        else:
-            diffusion_module = AtomDiffusion
-        self.structure_module = diffusion_module(
+        # Diffusion model, use version with twisted sampling
+        self.structure_module = ConformixAtomDiffusion(
             score_model_args={
                 "token_z": token_z,
                 "token_s": token_s,
@@ -267,7 +262,7 @@ class Boltz1(LightningModule):
         multiplicity_diffusion_train: int = 1,
         diffusion_samples: int = 1,
         run_confidence_sequentially: bool = False,
-        twisted_sample: bool = False, # Sample using TDS
+        conformix: bool = False, # Sample using TDS
         save_diff_inputs: bool = False, # For sweeps only
         **kwargs,
     ) -> dict[str, Tensor]:
@@ -326,7 +321,7 @@ class Boltz1(LightningModule):
             pdistogram = self.distogram_module(z)
             dict_out = {"pdistogram": pdistogram}
 
-        # Compute structure module
+        # Compute structure module 
         # training time
         if self.training and self.structure_prediction_training:
             dict_out.update(
@@ -340,47 +335,8 @@ class Boltz1(LightningModule):
                 )
             )
 
-        ## DDR
-        # inference time
-        # where sample happens
-
-        # print('using temporary twist fn')
-        def twist_fn(xt, x0_hat, return_grad=True, t=None):
-            ''' this is the bias potential '''
-
-            def bias_potential(atom_pos: Tensor):
-                # atom_diff = atom_pos[:,1957] - atom_pos[:,1015]
-                atom_diff = torch.mean(atom_pos[:,1940:1990], dim=-2) - torch.mean(atom_pos[:,990:1040], dim=-2)
-
-                target_diff = 24.1 # distance between SER 263 and LYS 138 in closed PGK conformation
-
-                # atom_diff has shape (batch_size, 3)
-                # compute diff for each sample in the batch
-
-                # print(atom_diff)
-                print("bias potential", (torch.norm(atom_diff, dim=-1) - target_diff)**2)
-                return (torch.norm(atom_diff, dim=-1) - target_diff)**2
-                # return torch.ones(atom_pos.shape[0], requires_grad=True) # for now don't use a bias
-
-            log_potential_xt_batch = torch.log(bias_potential(x0_hat))
-
-            if return_grad:
-                # compute gradient
-                grad_log_potential_xt_batch = torch.autograd.grad(
-                    log_potential_xt_batch,
-                    xt,
-                    grad_outputs=torch.ones_like(log_potential_xt_batch),
-                    create_graph=True,
-                    allow_unused=True,
-                )[0]
-                
-                return (log_potential_xt_batch.to(self.device).detach(), 1000 * grad_log_potential_xt_batch.to(self.device).detach())
-            else:
-                return log_potential_xt_batch.to(self.device).detach()
-
-
         if (not self.training) or self.confidence_prediction:
-            if twisted_sample:
+            if conformix:
                 # assert diffusion_samples > 1, "diffusion_samples must be greater than 1 when using TDS"
                 if diffusion_samples < 5:
                     print("Warning: diffusion_samples is less than 5")
@@ -395,7 +351,6 @@ class Boltz1(LightningModule):
                         atom_mask=feats["atom_pad_mask"],
                         multiplicity=diffusion_samples,
                         train_accumulate_token_repr=self.training,
-                        twist_fn=twist_fn,
                     )
                 )
             else:
@@ -1200,12 +1155,12 @@ class Boltz1(LightningModule):
                 num_sampling_steps=self.predict_args["sampling_steps"],
                 diffusion_samples=self.predict_args["diffusion_samples"],
                 run_confidence_sequentially=True,
-                twisted_sample=self.predict_args.get("twisted_sample", False),
+                conformix=self.predict_args.get("conformix", False),
             )
             pred_dict = {"exception": False}
             pred_dict["masks"] = batch["atom_pad_mask"]
             pred_dict["coords"] = out["sample_atom_coords"]
-            if self.predict_args.get("twisted_sample", False):
+            if self.predict_args.get("conformix", False):
                 pred_dict["ess_trace"] = out["ess_trace"]
             if self.predict_args.get("write_confidence_summary", True):
                 pred_dict["confidence_score"] = (
