@@ -32,7 +32,8 @@ import sys
 from pathlib import Path
 import numpy as np
 
-from boltz import run_untwisted, run_twisted, cif_to_xtc
+from boltz import run_untwisted, run_twisted
+from boltz.utils import cif_to_xtc
 
 def get_sequence_length_from_fasta(fasta_path: Path) -> int:
     """Reads a FASTA file and returns the length of the first sequence."""
