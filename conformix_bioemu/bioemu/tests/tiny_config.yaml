@@ -1,0 +1,11 @@
+score_model:
+  _target_: bioemu.shortcuts.DiGConditionalScoreModel
+  dim_hidden: 2
+  dim_model: 4
+  dim_pair: 2
+  dim_single_rep: 2
+  dropout: 0.1
+  max_distance_relative: 128
+  num_buckets: 4
+  num_heads: 1
+  num_layers: 1

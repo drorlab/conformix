@@ -1,0 +1,51 @@
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v4.4.0
+  hooks:
+  - id: check-added-large-files
+    args: [--maxkb=500, --enforce-all]
+  # Using this mirror lets us use mypyc-compiled black, which is about 2x faster
+- repo: https://github.com/psf/black-pre-commit-mirror
+  rev: 22.3.0
+  hooks:
+  - id: black
+    name: black
+    files: .*\.py
+    args: [--config=pyproject.toml]
+- repo: https://github.com/pycqa/isort
+  rev: 5.12.0
+  hooks:
+  - id: isort
+    name: isort
+    args: [--settings=pyproject.toml, --config-root=., --resolve-all-configs]
+- repo: https://github.com/pre-commit/mirrors-mypy
+  rev: v1.1.1
+  hooks:
+  - id: mypy
+    name: mypy
+    files: .*\.py
+    additional_dependencies:
+    - types-aiofiles
+    - types-cachetools
+    - types-python-dateutil
+    - types-python-slugify
+    - types-pytz
+    - types-PyYAML
+    - types-redis
+    - types-requests
+    - types-six
+    - types-tabulate
+    - types-toml
+    args:
+    - --ignore-missing-imports
+    - --no-namespace-packages
+    - --enable-incomplete-feature=Unpack
+    - --python-version=3.10
+    entry: mypy
+    exclude: src/bioemu/openfold/
+- repo: https://github.com/charliermarsh/ruff-pre-commit
+  rev: v0.7.0
+  hooks:
+  - id: ruff
+    args: [--fix]
+    files: .*\.py
