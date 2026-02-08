@@ -1,0 +1,16 @@
+# Membrane Transporters Benchmark Configuration
+# Tests ConforMix on membrane transporter proteins
+
+dataset_name: "membranetransporters"
+csv_path: "datasets/membranetransporters.csv"
+output_dir: "benchmark_results/membranetransporters"
+
+# Sampling parameters
+num_twist_targets: 5
+samples_per_target: 2
+twist_strength: 15.0
+structured_regions_only: true
+
+# Execution settings
+timeout_seconds: 4800  # 80 minutes - larger proteins
+skip_existing: true

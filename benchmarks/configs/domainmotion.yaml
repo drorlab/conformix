@@ -1,0 +1,16 @@
+# Domain Motion Benchmark Configuration
+# Tests ConforMix on 38 proteins with large-scale domain movements
+
+dataset_name: "domainmotion"
+csv_path: "datasets/domainmotion.csv"
+output_dir: "benchmark_results/domainmotion"
+
+# Sampling parameters
+num_twist_targets: 5
+samples_per_target: 2
+twist_strength: 15.0
+structured_regions_only: true
+
+# Execution settings
+timeout_seconds: 3600
+skip_existing: true

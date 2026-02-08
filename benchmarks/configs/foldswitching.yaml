@@ -1,0 +1,16 @@
+# Fold-Switching Benchmark Configuration
+# Tests ConforMix on 15 proteins that switch between different folds
+
+dataset_name: "foldswitching"
+csv_path: "datasets/foldswitching.csv"
+output_dir: "benchmark_results/foldswitching"
+
+# Sampling parameters - more samples for challenging transitions
+num_twist_targets: 8
+samples_per_target: 3
+twist_strength: 20.0
+structured_regions_only: true
+
+# Execution settings
+timeout_seconds: 5400  # 90 minutes - fold switching is harder
+skip_existing: true
