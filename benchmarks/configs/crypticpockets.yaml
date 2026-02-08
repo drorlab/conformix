@@ -1,0 +1,16 @@
+# Cryptic Pockets Benchmark Configuration
+# Tests ConforMix on 34 proteins with hidden binding sites
+
+dataset_name: "crypticpockets"
+csv_path: "datasets/crypticpockets.csv"
+output_dir: "benchmark_results/crypticpockets"
+
+# Sampling parameters
+num_twist_targets: 6
+samples_per_target: 2
+twist_strength: 15.0
+structured_regions_only: true
+
+# Execution settings
+timeout_seconds: 3600
+skip_existing: true
